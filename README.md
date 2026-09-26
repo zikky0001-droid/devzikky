@@ -190,6 +190,9 @@ The browser talks to your backend. The backend talks to the AI services. Provide
 devzikky/
 │
 ├── ai.html
+├── icon.png
+├── logo1.png
+├── logo2.png
 ├── server.js
 ├── package.json
 ├── .gitignore
