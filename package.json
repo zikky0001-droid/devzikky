@@ -1,0 +1,14 @@
+{
+  "name": "devzikky-ai",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DEVZIKKY AI — Built by DEV ZIKKY TECH",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
+
