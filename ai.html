@@ -77,7 +77,7 @@
   </section>
 </main>
 
-<button class="dz-chat-download" id="downloadChatBtn" type="button" aria-label="Download complete chat" title="Download the complete chat as an HTML file">
+<button class="dz-chat-download" id="downloadChatBtn" type="button" aria-label="Download complete chat" title="Download the complete chat as a ZIP containing HTML and JSON">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5M12 15V3"/></svg>
   <span>Download chat</span>
 </button>
@@ -247,26 +247,152 @@
     return value.replace(/[^a-z0-9-_]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase() || "devzikky-ai";
   }
 
-  function downloadFullChat() {
-    const messageNodes = Array.from(messagesEl.children).filter(node => node.classList.contains("msg"));
-    if (!messageNodes.length) {
-      showToast("No chat to download");
-      return;
+  // Build a standards-compliant ZIP archive using the ZIP "store" method.
+  // This avoids external libraries/CDNs and keeps the export fully client-side.
+  function createZipBlob(files) {
+    const encoder = new TextEncoder();
+    const crcTable = createCrc32Table();
+    const localParts = [];
+    const centralParts = [];
+    let localOffset = 0;
+
+    const write16 = (view, offset, value) => view.setUint16(offset, value, true);
+    const write32 = (view, offset, value) => view.setUint32(offset, value >>> 0, true);
+
+    for (const file of files) {
+      const nameBytes = encoder.encode(file.name);
+      const dataBytes = typeof file.content === "string"
+        ? encoder.encode(file.content)
+        : file.content;
+      const crc = crc32(dataBytes, crcTable);
+
+      const localHeader = new Uint8Array(30 + nameBytes.length);
+      const localView = new DataView(localHeader.buffer);
+      write32(localView, 0, 0x04034b50);
+      write16(localView, 4, 20);
+      write16(localView, 6, 0x0800); // UTF-8 filenames
+      write16(localView, 8, 0);      // Store, no compression
+      write16(localView, 10, 0);
+      write16(localView, 12, 0);
+      write32(localView, 14, crc);
+      write32(localView, 18, dataBytes.length);
+      write32(localView, 22, dataBytes.length);
+      write16(localView, 26, nameBytes.length);
+      write16(localView, 28, 0);
+      localHeader.set(nameBytes, 30);
+
+      const centralHeader = new Uint8Array(46 + nameBytes.length);
+      const centralView = new DataView(centralHeader.buffer);
+      write32(centralView, 0, 0x02014b50);
+      write16(centralView, 4, 20);
+      write16(centralView, 6, 20);
+      write16(centralView, 8, 0x0800);
+      write16(centralView, 10, 0);
+      write16(centralView, 12, 0);
+      write16(centralView, 14, 0);
+      write32(centralView, 16, crc);
+      write32(centralView, 20, dataBytes.length);
+      write32(centralView, 24, dataBytes.length);
+      write16(centralView, 28, nameBytes.length);
+      write16(centralView, 30, 0);
+      write16(centralView, 32, 0);
+      write16(centralView, 34, 0);
+      write16(centralView, 36, 0);
+      write32(centralView, 38, 0);
+      write32(centralView, 42, localOffset);
+      centralHeader.set(nameBytes, 46);
+
+      localParts.push(localHeader, dataBytes);
+      centralParts.push(centralHeader);
+      localOffset += localHeader.length + dataBytes.length;
     }
 
-    const transcript = messagesEl.cloneNode(true);
-    transcript.querySelectorAll(".dz-message-actions,.dz-code-copy").forEach(node => node.remove());
-    const exportedMessages = transcript.innerHTML;
-    const exportHtml = `<!doctype html>
+    const centralSize = centralParts.reduce((total, part) => total + part.length, 0);
+    const endRecord = new Uint8Array(22);
+    const endView = new DataView(endRecord.buffer);
+    write32(endView, 0, 0x06054b50);
+    write16(endView, 4, 0);
+    write16(endView, 6, 0);
+    write16(endView, 8, files.length);
+    write16(endView, 10, files.length);
+    write32(endView, 12, centralSize);
+    write32(endView, 16, localOffset);
+    write16(endView, 20, 0);
+
+    return new Blob([...localParts, ...centralParts, endRecord], {
+      type: "application/zip"
+    });
+  }
+
+  function createCrc32Table() {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) {
+        c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      }
+      table[n] = c >>> 0;
+    }
+    return table;
+  }
+
+  function crc32(bytes, table) {
+    let crc = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) {
+      crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  function buildChatHtmlExport(exportedMessages) {
+    return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>DEVZIKKY AI — Chat Export</title>
 <style>
 *{box-sizing:border-box}body{margin:0;padding:28px 16px;background:#080911;color:#f4f5fb;font:15px/1.7 Arial,sans-serif}.export{max-width:900px;margin:auto}.heading{margin:0 0 22px;padding-bottom:15px;border-bottom:1px solid #303244}.heading h1{margin:0;font-size:22px}.heading p{margin:4px 0 0;color:#9ba3b8;font-size:12px}.messages{display:flex;flex-direction:column;gap:14px}.msg{max-width:92%;padding:14px 16px;border-radius:16px;overflow-wrap:anywhere;white-space:normal}.msg.user{align-self:flex-end;background:linear-gradient(135deg,#7430b5,#a51e67)}.msg.ai{align-self:flex-start;background:#171a25;border:1px solid #303244}.dz-code-block{margin:12px 0;border:1px solid #343746;border-radius:10px;overflow:hidden;background:#05060a}.dz-code-head{padding:7px 11px;background:#171a25;border-bottom:1px solid #343746}.dz-code-language{font-size:11px;color:#aab4ca;letter-spacing:1px}.dz-code-block pre{margin:0;padding:14px;overflow:auto;white-space:pre;color:var(--dz-code-color,#00e5ff);font:13px/1.7 monospace}.msg code{background:#080911;padding:2px 5px;border-radius:4px;font-family:monospace}a{color:#00e5ff}.footer{margin-top:28px;color:#7f879b;font-size:11px;text-align:center}
 </style></head><body><main class="export"><header class="heading"><h1>DEVZIKKY AI — Conversation Export</h1><p>Exported from the current temporary chat session.</p></header><section class="messages">${exportedMessages}</section><p class="footer">Built with intent by DEV ZIKKY TECH</p></main></body></html>`;
+  }
+
+  function downloadFullChat() {
+    const messageNodes = Array.from(messagesEl.children)
+      .filter(node => node.classList.contains("msg"));
+    if (!messageNodes.length) {
+      showToast("No chat to download");
+      return;
+    }
+
+    // Keep the HTML export formatted, but remove interactive controls.
+    const transcript = messagesEl.cloneNode(true);
+    transcript.querySelectorAll(".dz-message-actions,.dz-code-copy").forEach(node => node.remove());
+    const exportHtml = buildChatHtmlExport(transcript.innerHTML);
+
+    // JSON is a clean, machine-readable transcript with one object per visible message.
+    // Reading the rendered messages ensures failed/fallback replies are included too.
+    const jsonMessages = messageNodes.map((node, index) => {
+      const isUser = node.classList.contains("user");
+      return {
+        id: index + 1,
+        role: isUser ? "user" : "assistant",
+        speaker: isUser ? "You" : "AI",
+        content: node._plainText || ""
+      };
+    });
+
+    const exportJson = JSON.stringify({
+      app: "DEVZIKKY AI",
+      exportedAt: new Date().toISOString(),
+      messageCount: jsonMessages.length,
+      messages: jsonMessages
+    }, null, 2);
 
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    downloadBlob(`devzikky-ai-chat-${stamp}.html`, exportHtml, "text/html;charset=utf-8");
-    showToast("Complete chat downloaded");
+    const zipBlob = createZipBlob([
+      { name: "chat.html", content: exportHtml },
+      { name: "chat.json", content: exportJson }
+    ]);
+
+    downloadBlob(`devzikky-ai-chat-${stamp}.zip`, zipBlob, "application/zip");
+    showToast("Chat ZIP downloaded · HTML + JSON");
   }
 
   /* ---------- UI helpers ---------- */
