@@ -32,6 +32,11 @@ const { URL } = require("url");
 
 const PORT = Number(process.env.PORT) || 3000;
 
+// Self-ping interval — edit this value to change the frequency.
+const SELF_PING_INTERVAL_MINUTES = 13;
+const SELF_PING_INTERVAL_MS = SELF_PING_INTERVAL_MINUTES * 60 * 1000;
+const SELF_PING_TIMEOUT_MS = 10000;
+
 const OPENROUTER_KEYS = [
   process.env.OPENROUTER_API_KEY_1 || "",
   process.env.OPENROUTER_API_KEY_2 || ""
@@ -696,6 +701,42 @@ const server = http.createServer(async (req, res) => {
    START
    ============================================================ */
 
+let selfPingTimer = null;
+let selfPingInProgress = false;
+
+async function selfPing() {
+  if (selfPingInProgress || !server.listening) return;
+
+  selfPingInProgress = true;
+  const baseUrl = (
+    process.env.RENDER_EXTERNAL_URL || `http://127.0.0.1:${PORT}`
+  ).replace(/\/+$/, "");
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    SELF_PING_TIMEOUT_MS
+  );
+
+  try {
+    const response = await fetch(`${baseUrl}/health`, {
+      method: "GET",
+      signal: controller.signal,
+      headers: { "User-Agent": "DEVZIKKY-AI-Self-Ping" }
+    });
+
+    if (!response.ok) {
+      console.warn(`[SELF-PING] Health check returned HTTP ${response.status}`);
+    } else {
+      console.log(`[SELF-PING] OK — ${baseUrl}/health`);
+    }
+  } catch (error) {
+    console.warn(`[SELF-PING] Failed: ${error.message}`);
+  } finally {
+    clearTimeout(timeout);
+    selfPingInProgress = false;
+  }
+}
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log("╔══════════════════════════════════════════╗");
   console.log("║          DEVZIKKY AI SERVER             ║");
@@ -709,6 +750,11 @@ server.listen(PORT, "0.0.0.0", () => {
     `[CONFIG] Groq: ${GROQ_API_KEY ? "configured" : "not configured"}`
   );
   console.log(`[CONFIG] Max output tokens: ${MAX_OUTPUT}`);
+  console.log(`[CONFIG] Self-ping interval: ${SELF_PING_INTERVAL_MINUTES} minutes`);
+
+  // First ping runs after the configured interval; no startup ping is needed.
+  selfPingTimer = setInterval(selfPing, SELF_PING_INTERVAL_MS);
+  selfPingTimer.unref();
 });
 
 /* ============================================================
@@ -717,6 +763,11 @@ server.listen(PORT, "0.0.0.0", () => {
 
 function shutdown(signal) {
   console.log(`[SERVER] ${signal} received. Shutting down...`);
+
+  if (selfPingTimer) {
+    clearInterval(selfPingTimer);
+    selfPingTimer = null;
+  }
 
   server.close(() => {
     console.log("[SERVER] Closed.");
