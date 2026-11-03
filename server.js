@@ -60,7 +60,9 @@ const MAX_OUTPUT = 4096;
 const OPENROUTER_TIMEOUT = 25000;
 const GROQ_TIMEOUT = 20000;
 const EXTERNAL_TIMEOUT = 20000;
-const TOTAL_BUDGET = 90000;
+// Vercel's chat function is configured for 60 seconds. Leave a small
+// response/cleanup margin; Render keeps the longer fallback window.
+const TOTAL_BUDGET = process.env.VERCEL ? 55000 : 90000;
 
 const BK9_URL = "https://api.bk9.dev/ai/morphic";
 const OMEGA_URL = "https://api.omegatech.app/api/ai/Chatgpt-v2";
@@ -649,7 +651,35 @@ async function handleChat(req, res) {
 }
 
 /* ============================================================
+   HEALTH HANDLER
+   ============================================================ */
+
+function handleHealth(req, res) {
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    return sendJSON(res, 405, { error: "Method not allowed" });
+  }
+
+  const body = JSON.stringify({
+    status: "ok",
+    service: "DEVZIKKY AI"
+  });
+
+  res.writeHead(200, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+    "Cache-Control": "no-store",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS"
+  });
+
+  if (req.method === "HEAD") return res.end();
+  return res.end(body);
+}
+
+/* ============================================================
    STATIC FILE SERVER
+   Render serves only files inside /public.
+   Vercel serves the same /public directory as static assets.
    ============================================================ */
 
 function safeFilePath(requestPath) {
@@ -663,18 +693,23 @@ function safeFilePath(requestPath) {
 
   pathname = pathname.replace(/\\/g, "/");
 
-  if (pathname.includes("..") || pathname.includes("\0")) {
+  if (
+    pathname.includes("..") ||
+    pathname.includes("\0") ||
+    pathname.startsWith("/.")
+  ) {
     return null;
   }
 
-  if (pathname === "/") {
-    pathname = "/ai.html";
-  }
+  if (pathname === "/") pathname = "/ai.html";
 
-  const root = path.resolve(__dirname);
-  const filePath = path.resolve(root, "." + pathname);
+  const publicRoot = path.resolve(__dirname, "public");
+  const filePath = path.resolve(publicRoot, "." + pathname);
 
-  if (filePath !== root && !filePath.startsWith(root + path.sep)) {
+  if (
+    filePath !== publicRoot &&
+    !filePath.startsWith(publicRoot + path.sep)
+  ) {
     return null;
   }
 
@@ -682,10 +717,16 @@ function safeFilePath(requestPath) {
 }
 
 function serveStatic(req, res) {
-  const parsed = new URL(
-    req.url,
-    `http://${req.headers.host || "localhost"}`
-  );
+  let parsed;
+
+  try {
+    parsed = new URL(
+      req.url,
+      `http://${req.headers.host || "localhost"}`
+    );
+  } catch {
+    return sendText(res, 400, "Bad request");
+  }
 
   const filePath = safeFilePath(parsed.pathname);
 
@@ -704,9 +745,13 @@ function serveStatic(req, res) {
 
     res.writeHead(200, {
       "Content-Type": contentType,
+      "Content-Length": stats.size,
       "Cache-Control":
-        ext === ".html" ? "no-cache" : "public, max-age=3600"
+        ext === ".html" ? "no-cache" : "public, max-age=3600",
+      "X-Content-Type-Options": "nosniff"
     });
+
+    if (req.method === "HEAD") return res.end();
 
     const stream = fs.createReadStream(filePath);
     stream.pipe(res);
@@ -722,51 +767,53 @@ function serveStatic(req, res) {
 }
 
 /* ============================================================
-   HTTP SERVER
+   HTTP SERVER FACTORY
    ============================================================ */
 
-const server = http.createServer(async (req, res) => {
-  try {
-    const parsed = new URL(
-      req.url,
-      `http://${req.headers.host || "localhost"}`
-    );
+function createServer() {
+  return http.createServer(async (req, res) => {
+    try {
+      const parsed = new URL(
+        req.url,
+        `http://${req.headers.host || "localhost"}`
+      );
 
-    if (parsed.pathname === "/api/chat") {
-      return await handleChat(req, res);
+      if (parsed.pathname === "/api/chat") {
+        return await handleChat(req, res);
+      }
+
+      if (parsed.pathname === "/health") {
+        return handleHealth(req, res);
+      }
+
+      if (req.method === "GET" || req.method === "HEAD") {
+        return serveStatic(req, res);
+      }
+
+      return sendJSON(res, 405, { error: "Method not allowed" });
+    } catch (error) {
+      console.error("[SERVER]", error);
+
+      if (!res.headersSent) {
+        sendJSON(res, 500, { error: "Internal server error" });
+      } else {
+        res.destroy();
+      }
     }
-
-    if (parsed.pathname === "/health") {
-      return sendJSON(res, 200, {
-        status: "ok",
-        service: "DEVZIKKY AI"
-      });
-    }
-
-    if (req.method === "GET" || req.method === "HEAD") {
-      return serveStatic(req, res);
-    }
-
-    return sendJSON(res, 405, { error: "Method not allowed" });
-  } catch (error) {
-    console.error("[SERVER]", error);
-
-    if (!res.headersSent) {
-      sendJSON(res, 500, { error: "Internal server error" });
-    } else {
-      res.destroy();
-    }
-  }
-});
+  });
+}
 
 /* ============================================================
-   START
+   RENDER / LOCAL SERVER LIFECYCLE
+   The server starts only when this file is executed directly.
+   Requiring it from Vercel Functions will NOT open a port.
    ============================================================ */
 
+let activeServer = null;
 let selfPingTimer = null;
 let selfPingInProgress = false;
 
-async function selfPing() {
+async function selfPing(server) {
   if (selfPingInProgress || !server.listening) return;
 
   selfPingInProgress = true;
@@ -787,7 +834,9 @@ async function selfPing() {
     });
 
     if (!response.ok) {
-      console.warn(`[SELF-PING] Health check returned HTTP ${response.status}`);
+      console.warn(
+        `[SELF-PING] Health check returned HTTP ${response.status}`
+      );
     } else {
       console.log(`[SELF-PING] OK — ${baseUrl}/health`);
     }
@@ -799,29 +848,41 @@ async function selfPing() {
   }
 }
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log("╔══════════════════════════════════════════╗");
-  console.log("║          DEVZIKKY AI SERVER             ║");
-  console.log("╠══════════════════════════════════════════╣");
-  console.log(`║ Port: ${String(PORT).padEnd(33)}║`);
-  console.log("║ API:  /api/chat                         ║");
-  console.log("║ Health: /health                         ║");
-  console.log("╚══════════════════════════════════════════╝");
-  console.log(`[CONFIG] OpenRouter keys: ${OPENROUTER_KEYS.length}`);
-  console.log(
-    `[CONFIG] Groq: ${GROQ_API_KEY ? "configured" : "not configured"}`
-  );
-  console.log(`[CONFIG] Max output tokens: ${MAX_OUTPUT}`);
-  console.log(`[CONFIG] Self-ping interval: ${SELF_PING_INTERVAL_MINUTES} minutes`);
+function startServer() {
+  if (activeServer) return activeServer;
 
-  // First ping runs after the configured interval; no startup ping is needed.
-  selfPingTimer = setInterval(selfPing, SELF_PING_INTERVAL_MS);
-  selfPingTimer.unref();
-});
+  const server = createServer();
+  activeServer = server;
 
-/* ============================================================
-   GRACEFUL SHUTDOWN
-   ============================================================ */
+  server.listen(PORT, "0.0.0.0", () => {
+    console.log("╔══════════════════════════════════════════╗");
+    console.log("║          DEVZIKKY AI SERVER             ║");
+    console.log("╠══════════════════════════════════════════╣");
+    console.log(`║ Port: ${String(PORT).padEnd(33)}║`);
+    console.log("║ API:  /api/chat                         ║");
+    console.log("║ Health: /health                         ║");
+    console.log("╚══════════════════════════════════════════╝");
+    console.log(`[CONFIG] OpenRouter keys: ${OPENROUTER_KEYS.length}`);
+    console.log(
+      `[CONFIG] Groq: ${GROQ_API_KEY ? "configured" : "not configured"}`
+    );
+    console.log(`[CONFIG] Max output tokens: ${MAX_OUTPUT}`);
+    console.log(
+      `[CONFIG] AI request budget: ${TOTAL_BUDGET / 1000}s`
+    );
+    console.log(
+      `[CONFIG] Self-ping interval: ${SELF_PING_INTERVAL_MINUTES} minutes`
+    );
+
+    selfPingTimer = setInterval(
+      () => selfPing(server),
+      SELF_PING_INTERVAL_MS
+    );
+    selfPingTimer.unref();
+  });
+
+  return server;
+}
 
 function shutdown(signal) {
   console.log(`[SERVER] ${signal} received. Shutting down...`);
@@ -831,7 +892,9 @@ function shutdown(signal) {
     selfPingTimer = null;
   }
 
-  server.close(() => {
+  if (!activeServer) return process.exit(0);
+
+  activeServer.close(() => {
     console.log("[SERVER] Closed.");
     process.exit(0);
   });
@@ -839,8 +902,24 @@ function shutdown(signal) {
   setTimeout(() => process.exit(1), 10000).unref();
 }
 
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+/* ============================================================
+   EXPORTS FOR VERCEL FUNCTIONS
+   ============================================================ */
 
+module.exports = {
+  handleChat,
+  handleHealth,
+  createServer,
+  startServer
+};
 
+/* ============================================================
+   START ONLY FOR RENDER / LOCAL EXECUTION
+   ============================================================ */
 
+if (require.main === module) {
+  startServer();
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+}

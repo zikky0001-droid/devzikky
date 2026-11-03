@@ -2,10 +2,11 @@
 
 ## Project layout
 
-- `public/ai.html` is the frontend served at `/`.
-- `server.js` is the persistent Node.js server used by Render and local development.
-- `api/chat.js` and `api/health.js` are Vercel Node.js Functions.
-- `vercel.json` configures the Vercel routes and function durations.
+- `public/ai.html` is the single frontend, served at `/`.
+- `public/` contains public static assets only.
+- `server.js` contains shared AI logic and the Render/local HTTP server.
+- `api/chat.js` and `api/health.js` export Vercel Node.js Function handlers.
+- `vercel.json` configures Vercel function durations and the `/health` alias.
 - `render.yaml` defines the Render web service.
 
 ## Environment variables
@@ -21,12 +22,64 @@ At least one working provider must be configured for AI responses.
 
 ## Render
 
-Create a Blueprint from this repository and use the root `render.yaml`. The service runs `npm start`; `/health` is the health-check path.
+Create a Blueprint from this repository and use the root `render.yaml`.
+Render runs `npm start`, which starts the persistent HTTP server in `server.js`.
+The server serves `public/ai.html` at `/`, exposes `POST /api/chat`, and exposes
+`GET /health` for Render's health check.
 
 ## Vercel
 
-Import the repository as a project. Vercel serves files from `public/` and deploys the handlers in `api/` as Node.js Functions. Configure the same provider environment variables in Project Settings. The chat function is capped at 60 seconds, so its provider fallback budget is reduced to 55 seconds on Vercel; Render retains the original 90-second budget.
+Import the repository with the repository root (`.`) as the Root Directory.
+Use the `Other` framework preset and do not set a custom Output Directory.
 
-## Favicon
+Vercel serves files from `public/` and deploys `api/chat.js` and
+`api/health.js` as Node.js Functions. These functions import shared handlers
+from `server.js`. Importing `server.js` does not start an HTTP listener;
+the listener starts only when `server.js` is executed directly by Render/local
+Node.js.
 
-The supplied ZIP referenced `icon.png` from the HTML but did not contain that file. Add your `icon.png` to `public/icon.png` to enable the favicon and Apple touch icon. The missing icon does not prevent the app or API from running.
+The Vercel chat function has a 60-second maximum duration. The shared AI
+fallback budget automatically uses 55 seconds on Vercel to leave time for
+response delivery. Render retains the 90-second budget.
+
+Configure the same provider environment variables in Vercel Project Settings.
+Redeploy after changing environment variables or project configuration.
+
+## API contracts
+
+### POST /api/chat
+
+Request:
+
+```json
+{
+  "message": "Hello",
+  "history": []
+}
+```
+
+Successful response:
+
+```json
+{
+  "reply": "Hello! How can I help?",
+  "truncated": false
+}
+```
+
+### GET /health
+
+Response:
+
+```json
+{
+  "status": "ok",
+  "service": "DEVZIKKY AI"
+}
+```
+
+## Static assets
+
+Place the favicon and any image assets referenced by the frontend inside
+`public/`. The uploaded source ZIP did not include the referenced `icon.png`;
+add it as `public/icon.png` if you have the original image.
