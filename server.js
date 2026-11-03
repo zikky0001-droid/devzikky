@@ -1,7 +1,7 @@
 /*
  * ============================================================
  * DEVZIKKY AI — server.js
- * Backend for index.html
+ * Backend for ai.html
  * Endpoints:
  *   POST /api/chat
  *   GET  /health
@@ -202,27 +202,82 @@ function sendText(res, status, text, contentType = "text/plain") {
 
 function readRequestBody(req, maxBytes = 1024 * 1024) {
   return new Promise((resolve, reject) => {
-    let data = "";
+    const chunks = [];
     let size = 0;
+    let tooLarge = false;
 
     req.on("data", chunk => {
-      size += Buffer.byteLength(chunk);
+      if (tooLarge) return;
+
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += buffer.length;
 
       if (size > maxBytes) {
-        reject(new Error("Request body too large"));
-        req.destroy();
+        tooLarge = true;
+        chunks.length = 0;
         return;
       }
 
-      data += chunk;
+      chunks.push(buffer);
     });
 
     req.on("end", () => {
-      resolve(data);
+      if (tooLarge) {
+        const error = new Error("Request body too large");
+        error.statusCode = 413;
+        reject(error);
+        return;
+      }
+
+      resolve(Buffer.concat(chunks).toString("utf8"));
     });
 
     req.on("error", reject);
   });
+}
+
+// Vercel's Node.js Functions may provide an already-parsed req.body,
+// while the standalone Render server receives the raw request stream.
+// Support both forms without consuming an already-parsed request stream.
+async function parseRequestBody(req) {
+  if (req.body !== undefined) {
+    const suppliedBody = req.body;
+
+    if (Buffer.isBuffer(suppliedBody)) {
+      try {
+        return JSON.parse(suppliedBody.toString("utf8") || "{}");
+      } catch {
+        throw new Error("Invalid request body");
+      }
+    }
+
+    if (typeof suppliedBody === "string") {
+      try {
+        return JSON.parse(suppliedBody || "{}");
+      } catch {
+        throw new Error("Invalid request body");
+      }
+    }
+
+    if (suppliedBody === null) return {};
+
+    if (
+      typeof suppliedBody === "object" &&
+      !Array.isArray(suppliedBody)
+    ) {
+      return suppliedBody;
+    }
+
+    throw new Error("Invalid request body");
+  }
+
+  const rawBody = await readRequestBody(req);
+
+  try {
+    return JSON.parse(rawBody || "{}");
+  } catch {
+    throw new Error("Invalid request body");
+  }
 }
 
 function cleanHistory(history) {
@@ -541,16 +596,23 @@ async function handleChat(req, res) {
     return sendJSON(res, 405, { error: "Method not allowed" });
   }
 
-  try {
-    const rawBody = await readRequestBody(req);
+  let body;
 
-    let body;
-    try {
-      body = JSON.parse(rawBody || "{}");
-    } catch {
-      return sendJSON(res, 400, { error: "Invalid request" });
+  try {
+    body = await parseRequestBody(req);
+  } catch (error) {
+    if (error.statusCode === 413) {
+      return sendJSON(res, 413, { error: "Request body too large" });
     }
 
+    return sendJSON(res, 400, { error: "Invalid request" });
+  }
+
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return sendJSON(res, 400, { error: "Invalid request" });
+  }
+
+  try {
     const message =
       typeof body.message === "string"
         ? body.message.trim()
@@ -606,7 +668,7 @@ function safeFilePath(requestPath) {
   }
 
   if (pathname === "/") {
-    pathname = "/index.html";     // ← was /ai.html
+    pathname = "/ai.html";
   }
 
   const root = path.resolve(__dirname);
