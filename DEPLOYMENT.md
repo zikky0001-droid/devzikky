@@ -1,85 +1,68 @@
-# DEVZIKKY AI deployment
+# DEVZIKKY AI — Render and Vercel
 
-## Project layout
+This project keeps the frontend and server source files in the repository root.
+The only added directory for Vercel API calls is `api/`.
 
-- `public/ai.html` is the single frontend, served at `/`.
-- `public/` contains public static assets only.
-- `server.js` contains shared AI logic and the Render/local HTTP server.
-- `api/chat.js` and `api/health.js` export Vercel Node.js Function handlers.
-- `vercel.json` configures Vercel function durations and the `/health` alias.
-- `render.yaml` defines the Render web service.
-
-## Environment variables
-
-Set these in the hosting provider dashboard. Never commit real API keys.
-
-- `OPENROUTER_API_KEY_1` (optional if another provider is configured)
-- `OPENROUTER_API_KEY_2` (optional)
-- `GROQ_API_KEY` (optional)
-- `GROQ_MODEL` (optional; defaults to `openai/gpt-oss-20b`)
-
-At least one working provider must be configured for AI responses.
-
-## Render
-
-Create a Blueprint from this repository and use the root `render.yaml`.
-Render runs `npm start`, which starts the persistent HTTP server in `server.js`.
-The server serves `public/ai.html` at `/`, exposes `POST /api/chat`, and exposes
-`GET /health` for Render's health check.
+```text
+.
+├── api/
+│   ├── chat.js
+│   └── health.js
+├── ai.html
+├── package.json
+├── server.js
+├── vercel.json
+└── render.yaml
+```
 
 ## Vercel
 
-Import the repository with the repository root (`.`) as the Root Directory.
-Use the `Other` framework preset and do not set a custom Output Directory.
+- Set the project's Root Directory to the repository root (`.`).
+- Select the `Other` framework preset (also set by `vercel.json`).
+- `vercel.json` explicitly sets the Output Directory to `.` so root-level frontend files are published; do not add a `public/` folder or a legacy `builds` configuration.
+- Add `OPENROUTER_API_KEY_1`, `OPENROUTER_API_KEY_2`, and `GROQ_API_KEY` in Project Settings → Environment Variables. `GROQ_MODEL` is optional.
+- Redeploy after setting environment variables.
 
-Vercel serves files from `public/` and deploys `api/chat.js` and
-`api/health.js` as Node.js Functions. These functions import shared handlers
-from `server.js`. Importing `server.js` does not start an HTTP listener;
-the listener starts only when `server.js` is executed directly by Render/local
-Node.js.
+Routes:
+- `GET /` routes to the root-level `ai.html` file.
+- `POST /api/chat` invokes `api/chat.js`.
+- `GET /api/health` invokes `api/health.js`.
+- `GET /health` invokes the same health function.
+- Direct requests for backend/config source files and `api/*.js` source paths return 404; only the extensionless API routes are public.
 
-The Vercel chat function has a 60-second maximum duration. The shared AI
-fallback budget automatically uses 55 seconds on Vercel to leave time for
-response delivery. Render retains the 90-second budget.
+The function budget is 54 seconds inside the configured 60-second chat function limit, leaving time to send the response. Render retains the original 90-second AI chain budget.
 
-Configure the same provider environment variables in Vercel Project Settings.
-Redeploy after changing environment variables or project configuration.
+## Render
 
-## API contracts
+Create a Blueprint from the repository using `render.yaml`, or configure a Node web service manually:
+- Build command: `npm install`
+- Start command: `npm start`
+- Health check path: `/health`
 
-### POST /api/chat
+Render runs `node server.js` as a persistent HTTP server. The original 13-minute self-ping behavior is retained for Render only. Importing `server.js` from a Vercel function does not start a listener or self-ping timer.
 
-Request:
+## API contract
 
-```json
-{
-  "message": "Hello",
-  "history": []
-}
-```
-
-Successful response:
+`POST /api/chat` request:
 
 ```json
-{
-  "reply": "Hello! How can I help?",
-  "truncated": false
-}
+{ "message": "Hello", "history": [] }
 ```
 
-### GET /health
-
-Response:
+Success response:
 
 ```json
-{
-  "status": "ok",
-  "service": "DEVZIKKY AI"
-}
+{ "reply": "...", "truncated": false }
 ```
 
-## Static assets
+`GET /health` and `GET /api/health` response:
 
-Place the favicon and any image assets referenced by the frontend inside
-`public/`. The uploaded source ZIP did not include the referenced `icon.png`;
-add it as `public/icon.png` if you have the original image.
+```json
+{ "status": "ok", "service": "DEVZIKKY AI" }
+```
+
+The API accepts Vercel's already-parsed `req.body` as well as the raw Node.js request stream used by Render.
+
+## Static files
+
+The HTML file and any frontend assets stay in the project root. The original uploaded ZIP contains `ai.html` but does not contain `icon.png`; add your original `icon.png` to the root if you want the favicon references in `ai.html` to resolve. Do not place API keys in source files or commit `.env` files.

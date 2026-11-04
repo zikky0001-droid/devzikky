@@ -26,3 +26,6 @@ temp/
 
 # Render / deployment
 .render/
+
+# Vercel local project metadata
+.vercel/

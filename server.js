@@ -60,9 +60,10 @@ const MAX_OUTPUT = 4096;
 const OPENROUTER_TIMEOUT = 25000;
 const GROQ_TIMEOUT = 20000;
 const EXTERNAL_TIMEOUT = 20000;
-// Vercel's chat function is configured for 60 seconds. Leave a small
-// response/cleanup margin; Render keeps the longer fallback window.
-const TOTAL_BUDGET = process.env.VERCEL ? 55000 : 90000;
+// Vercel Hobby functions can run for up to 60 seconds. Keep a response
+// margin so the function can serialize and return the result before timeout.
+// Render runs as a persistent Node server and retains the original 90s budget.
+const TOTAL_BUDGET = process.env.VERCEL ? 54000 : 90000;
 
 const BK9_URL = "https://api.bk9.dev/ai/morphic";
 const OMEGA_URL = "https://api.omegatech.app/api/ai/Chatgpt-v2";
@@ -203,20 +204,51 @@ function sendText(res, status, text, contentType = "text/plain") {
 }
 
 function readRequestBody(req, maxBytes = 1024 * 1024) {
+  // Vercel's Node.js runtime may provide an already-parsed body. Render's
+  // native http server provides a readable request stream instead.
+  if (req.body !== undefined) {
+    try {
+      const body = req.body;
+
+      if (typeof body === "string" || Buffer.isBuffer(body)) {
+        const raw = Buffer.isBuffer(body) ? body.toString("utf8") : body;
+        if (Buffer.byteLength(raw) > maxBytes) {
+          return Promise.reject(Object.assign(
+            new Error("Request body too large"), { statusCode: 413 }
+          ));
+        }
+        return Promise.resolve(raw);
+      }
+
+      const raw = JSON.stringify(body ?? {});
+      if (Buffer.byteLength(raw) > maxBytes) {
+        return Promise.reject(Object.assign(
+          new Error("Request body too large"), { statusCode: 413 }
+        ));
+      }
+      return Promise.resolve(raw);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
-    let tooLarge = false;
+    let settled = false;
 
     req.on("data", chunk => {
-      if (tooLarge) return;
-
+      if (settled) return;
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       size += buffer.length;
 
       if (size > maxBytes) {
-        tooLarge = true;
-        chunks.length = 0;
+        settled = true;
+        reject(Object.assign(
+          new Error("Request body too large"), { statusCode: 413 }
+        ));
+        // Drain the incoming request rather than destroying the socket.
+        req.resume();
         return;
       }
 
@@ -224,61 +256,30 @@ function readRequestBody(req, maxBytes = 1024 * 1024) {
     });
 
     req.on("end", () => {
-      if (tooLarge) {
-        const error = new Error("Request body too large");
-        error.statusCode = 413;
-        reject(error);
-        return;
-      }
-
-      resolve(Buffer.concat(chunks).toString("utf8"));
+      if (!settled) resolve(Buffer.concat(chunks).toString("utf8"));
     });
 
-    req.on("error", reject);
+    req.on("error", error => {
+      if (!settled) {
+        settled = true;
+        reject(error);
+      }
+    });
   });
 }
 
-// Vercel's Node.js Functions may provide an already-parsed req.body,
-// while the standalone Render server receives the raw request stream.
-// Support both forms without consuming an already-parsed request stream.
 async function parseRequestBody(req) {
-  if (req.body !== undefined) {
-    const suppliedBody = req.body;
-
-    if (Buffer.isBuffer(suppliedBody)) {
-      try {
-        return JSON.parse(suppliedBody.toString("utf8") || "{}");
-      } catch {
-        throw new Error("Invalid request body");
-      }
-    }
-
-    if (typeof suppliedBody === "string") {
-      try {
-        return JSON.parse(suppliedBody || "{}");
-      } catch {
-        throw new Error("Invalid request body");
-      }
-    }
-
-    if (suppliedBody === null) return {};
-
-    if (
-      typeof suppliedBody === "object" &&
-      !Array.isArray(suppliedBody)
-    ) {
-      return suppliedBody;
-    }
-
-    throw new Error("Invalid request body");
-  }
-
   const rawBody = await readRequestBody(req);
+  if (rawBody && typeof rawBody === "object") return rawBody;
 
   try {
-    return JSON.parse(rawBody || "{}");
+    const parsed = JSON.parse(rawBody || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Invalid request body");
+    }
+    return parsed;
   } catch {
-    throw new Error("Invalid request body");
+    throw Object.assign(new Error("Invalid request"), { statusCode: 400 });
   }
 }
 
@@ -598,23 +599,9 @@ async function handleChat(req, res) {
     return sendJSON(res, 405, { error: "Method not allowed" });
   }
 
-  let body;
-
   try {
-    body = await parseRequestBody(req);
-  } catch (error) {
-    if (error.statusCode === 413) {
-      return sendJSON(res, 413, { error: "Request body too large" });
-    }
+    const body = await parseRequestBody(req);
 
-    return sendJSON(res, 400, { error: "Invalid request" });
-  }
-
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    return sendJSON(res, 400, { error: "Invalid request" });
-  }
-
-  try {
     const message =
       typeof body.message === "string"
         ? body.message.trim()
@@ -645,13 +632,19 @@ async function handleChat(req, res) {
       truncated: result.truncated === true
     });
   } catch (error) {
+    if (error.statusCode === 400 || error.statusCode === 413) {
+      return sendJSON(res, error.statusCode, {
+        error: error.statusCode === 413 ? "Request body too large" : "Invalid request"
+      });
+    }
+
     console.error("[AI] Request failed:", error.message);
     return sendJSON(res, 503, { error: "AI unavailable" });
   }
 }
 
 /* ============================================================
-   HEALTH HANDLER
+   HEALTH HANDLER — shared by Render and Vercel
    ============================================================ */
 
 function handleHealth(req, res) {
@@ -669,6 +662,7 @@ function handleHealth(req, res) {
     "Content-Length": Buffer.byteLength(body),
     "Cache-Control": "no-store",
     "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type",
     "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS"
   });
 
@@ -677,9 +671,8 @@ function handleHealth(req, res) {
 }
 
 /* ============================================================
-   STATIC FILE SERVER
-   Render serves only files inside /public.
-   Vercel serves the same /public directory as static assets.
+   STATIC FILE SERVER (Render)
+   Only frontend/static assets are served. Backend/config files stay private.
    ============================================================ */
 
 function safeFilePath(requestPath) {
@@ -693,23 +686,41 @@ function safeFilePath(requestPath) {
 
   pathname = pathname.replace(/\\/g, "/");
 
-  if (
-    pathname.includes("..") ||
-    pathname.includes("\0") ||
-    pathname.startsWith("/.")
-  ) {
+  if (pathname.includes("..") || pathname.includes("\0")) {
     return null;
   }
 
-  if (pathname === "/") pathname = "/ai.html";
+  // API source files are invoked by the platform, never served as static files.
+  if (pathname === "/api" || pathname.startsWith("/api/")) {
+    return null;
+  }
 
-  const publicRoot = path.resolve(__dirname, "public");
-  const filePath = path.resolve(publicRoot, "." + pathname);
+  if (pathname === "/") {
+    pathname = "/ai.html";
+  }
 
-  if (
-    filePath !== publicRoot &&
-    !filePath.startsWith(publicRoot + path.sep)
-  ) {
+  const basename = path.basename(pathname).toLowerCase();
+  const blockedNames = new Set([
+    "server.js", "package.json", "package-lock.json", "vercel.json",
+    "render.yaml", ".gitignore", "readme.md", "license", ".env"
+  ]);
+
+  if (basename.startsWith(".env") || blockedNames.has(basename)) {
+    return null;
+  }
+
+  const allowedExtensions = new Set([
+    ".html", ".css", ".js", ".mjs", ".png", ".jpg", ".jpeg",
+    ".gif", ".svg", ".ico", ".webp", ".woff", ".woff2", ".ttf"
+  ]);
+  if (!allowedExtensions.has(path.extname(pathname).toLowerCase())) {
+    return null;
+  }
+
+  const root = path.resolve(__dirname);
+  const filePath = path.resolve(root, "." + pathname);
+
+  if (filePath !== root && !filePath.startsWith(root + path.sep)) {
     return null;
   }
 
@@ -717,21 +728,16 @@ function safeFilePath(requestPath) {
 }
 
 function serveStatic(req, res) {
-  let parsed;
-
-  try {
-    parsed = new URL(
-      req.url,
-      `http://${req.headers.host || "localhost"}`
-    );
-  } catch {
-    return sendText(res, 400, "Bad request");
-  }
+  const parsed = new URL(
+    req.url,
+    `http://${req.headers.host || "localhost"}`
+  );
 
   const filePath = safeFilePath(parsed.pathname);
 
   if (!filePath) {
-    return sendText(res, 400, "Bad request");
+    // Do not disclose whether a blocked backend/config file exists.
+    return sendText(res, 404, "Not found");
   }
 
   fs.stat(filePath, (error, stats) => {
@@ -746,9 +752,9 @@ function serveStatic(req, res) {
     res.writeHead(200, {
       "Content-Type": contentType,
       "Content-Length": stats.size,
+      "X-Content-Type-Options": "nosniff",
       "Cache-Control":
-        ext === ".html" ? "no-cache" : "public, max-age=3600",
-      "X-Content-Type-Options": "nosniff"
+        ext === ".html" ? "no-cache" : "public, max-age=3600"
     });
 
     if (req.method === "HEAD") return res.end();
@@ -804,17 +810,16 @@ function createServer() {
 }
 
 /* ============================================================
-   RENDER / LOCAL SERVER LIFECYCLE
-   The server starts only when this file is executed directly.
-   Requiring it from Vercel Functions will NOT open a port.
+   RENDER SELF-PING
+   Only started by startServer(); never runs inside Vercel Functions.
    ============================================================ */
 
 let activeServer = null;
 let selfPingTimer = null;
 let selfPingInProgress = false;
 
-async function selfPing(server) {
-  if (selfPingInProgress || !server.listening) return;
+async function selfPing() {
+  if (selfPingInProgress || !activeServer || !activeServer.listening) return;
 
   selfPingInProgress = true;
   const baseUrl = (
@@ -834,9 +839,7 @@ async function selfPing(server) {
     });
 
     if (!response.ok) {
-      console.warn(
-        `[SELF-PING] Health check returned HTTP ${response.status}`
-      );
+      console.warn(`[SELF-PING] Health check returned HTTP ${response.status}`);
     } else {
       console.log(`[SELF-PING] OK — ${baseUrl}/health`);
     }
@@ -851,10 +854,8 @@ async function selfPing(server) {
 function startServer() {
   if (activeServer) return activeServer;
 
-  const server = createServer();
-  activeServer = server;
-
-  server.listen(PORT, "0.0.0.0", () => {
+  activeServer = createServer();
+  activeServer.listen(PORT, "0.0.0.0", () => {
     console.log("╔══════════════════════════════════════════╗");
     console.log("║          DEVZIKKY AI SERVER             ║");
     console.log("╠══════════════════════════════════════════╣");
@@ -867,21 +868,15 @@ function startServer() {
       `[CONFIG] Groq: ${GROQ_API_KEY ? "configured" : "not configured"}`
     );
     console.log(`[CONFIG] Max output tokens: ${MAX_OUTPUT}`);
-    console.log(
-      `[CONFIG] AI request budget: ${TOTAL_BUDGET / 1000}s`
-    );
-    console.log(
-      `[CONFIG] Self-ping interval: ${SELF_PING_INTERVAL_MINUTES} minutes`
-    );
+    console.log(`[CONFIG] AI request budget: ${TOTAL_BUDGET / 1000}s`);
+    console.log(`[CONFIG] Self-ping interval: ${SELF_PING_INTERVAL_MINUTES} minutes`);
 
-    selfPingTimer = setInterval(
-      () => selfPing(server),
-      SELF_PING_INTERVAL_MS
-    );
+    // Preserve the original Render self-ping cadence.
+    selfPingTimer = setInterval(selfPing, SELF_PING_INTERVAL_MS);
     selfPingTimer.unref();
   });
 
-  return server;
+  return activeServer;
 }
 
 function shutdown(signal) {
@@ -903,7 +898,7 @@ function shutdown(signal) {
 }
 
 /* ============================================================
-   EXPORTS FOR VERCEL FUNCTIONS
+   VERCEL FUNCTION EXPORTS
    ============================================================ */
 
 module.exports = {
@@ -914,12 +909,11 @@ module.exports = {
 };
 
 /* ============================================================
-   START ONLY FOR RENDER / LOCAL EXECUTION
+   START ONLY WHEN RUN DIRECTLY (Render / local Node.js)
    ============================================================ */
 
 if (require.main === module) {
   startServer();
-
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 }

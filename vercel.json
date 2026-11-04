@@ -1,5 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
   "functions": {
     "api/chat.js": {
       "maxDuration": 60
@@ -8,29 +9,38 @@
       "maxDuration": 10
     }
   },
-  "rewrites": [
+  "outputDirectory": ".",
+  "routes": [
     {
-      "source": "/",
-      "destination": "/ai.html"
+      "src": "^/(?:server\\.js|package\\.json|package-lock\\.json|vercel\\.json|render\\.yaml|\\.gitignore|DEPLOYMENT\\.md|README\\.md|LICENSE)$",
+      "status": 404
     },
     {
-      "source": "/health",
-      "destination": "/api/health"
-    }
-  ],
-  "headers": [
+      "src": "^/\\.env(?:\\..*)?$",
+      "status": 404
+    },
     {
-      "source": "/(.*)",
-      "headers": [
-        {
-          "key": "X-Content-Type-Options",
-          "value": "nosniff"
-        },
-        {
-          "key": "Referrer-Policy",
-          "value": "strict-origin-when-cross-origin"
-        }
-      ]
+      "src": "^/api/.*\\.js$",
+      "status": 404
+    },
+    {
+      "src": "^/api/chat$",
+      "dest": "/api/chat.js"
+    },
+    {
+      "src": "^/api/health$",
+      "dest": "/api/health.js"
+    },
+    {
+      "src": "^/health$",
+      "dest": "/api/health.js"
+    },
+    {
+      "src": "^/$",
+      "dest": "/ai.html"
+    },
+    {
+      "handle": "filesystem"
     }
   ]
 }
